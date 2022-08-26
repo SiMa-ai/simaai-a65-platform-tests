@@ -1,17 +1,46 @@
 #include <linux/gpio.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <pthread.h>
 
 #define PORTA "/dev/gpiochip0"
 #define PORTB "/dev/gpiochip1"
 #define PORTC "/dev/gpiochip2"
 #define PORTD "/dev/gpiochip3"
+
+#define GPIO_PAD_REGISTER 			0x719000
+#define GPIOS_PER_PAD_REGISTER		4
+#define DEFAULT_PAD_REGISTER_VALUE	0x2040810
+
+#define GPIO_0_PULL_UP_BIT			1
+#define GPIO_1_PULL_UP_BIT			7
+#define GPIO_2_PULL_UP_BIT			14
+#define GPIO_3_PULL_UP_BIT			21
+
+#define GPIO_0_PULL_DOWN_BIT			0
+#define GPIO_1_PULL_DOWN_BIT			8
+#define GPIO_2_PULL_DOWN_BIT			16
+#define GPIO_3_PULL_DOWN_BIT			24
+
+#define GPIO_0_PULL_UP_BIT_MASK		(1 << GPIO_0_PULL_UP_BIT)
+#define GPIO_1_PULL_UP_BIT_MASK		(1 << GPIO_1_PULL_UP_BIT)
+#define GPIO_2_PULL_UP_BIT_MASK		(1 << GPIO_2_PULL_UP_BIT)
+#define GPIO_3_PULL_UP_BIT_MASK		(1 << GPIO_3_PULL_UP_BIT)
+
+#define GPIO_0_PULL_DOWN_BIT_MASK	(1 << GPIO_0_PULL_DOWN_BIT)
+#define GPIO_1_PULL_DOWN_BIT_MASK	(1 << GPIO_1_PULL_DOWN_BIT)
+#define GPIO_2_PULL_DOWN_BIT_MASK	(1 << GPIO_2_PULL_DOWN_BIT)
+#define GPIO_3_PULL_DOWN_BIT_MASK	(1 << GPIO_3_PULL_DOWN_BIT)
+
+#define DEVMEM_STR "devmem2 0x%x %c 0x%x"
+
 
 char *port_paths[] = {
 	PORTA,
@@ -21,7 +50,22 @@ char *port_paths[] = {
 };
 
 #define TOTAL_NUM_PORTS (sizeof(port_paths)/sizeof(port_paths[0]))
-#define MAX_GPIOS_PER_PORT 8
+#define MAX_GPIOS_PER_PORT 	8
+#define MAX_GPIOS			32
+
+int port_pull_up_regs_bit_mask[] = {
+	GPIO_0_PULL_UP_BIT_MASK,
+	GPIO_1_PULL_UP_BIT_MASK,
+	GPIO_2_PULL_UP_BIT_MASK,
+	GPIO_3_PULL_UP_BIT_MASK
+};
+
+int port_pull_down_regs_bit_mask[] = {
+	GPIO_0_PULL_DOWN_BIT_MASK,
+	GPIO_1_PULL_DOWN_BIT_MASK,
+	GPIO_2_PULL_DOWN_BIT_MASK,
+	GPIO_3_PULL_DOWN_BIT_MASK
+};
 
 /*
 ** Print port information
@@ -173,6 +217,7 @@ void print_binary_pattern(char *port_path, unsigned int *led_arr, unsigned int a
 	close(fd);
 }
 
+#if 0
 void overnight_test() {
 
 	unsigned int num = 0;
@@ -262,6 +307,7 @@ void overnight_test() {
 		close(fd[iter]);
 	}
 }
+#endif
 
 void get_chip_and_gpio_number(unsigned int *chip_number,
 				unsigned int *gpio_number) {
@@ -298,27 +344,22 @@ void get_chip_and_gpio_number(unsigned int *chip_number,
 	} //while(1) ends
 }
 
-void read_gpio_port() {
+unsigned int
+__read_gpio_port(unsigned int chip_number, unsigned int gpio_number) {
 
 	struct gpiohandle_request req;
 	struct gpiohandle_data data;
 	int fd, rv;
-	unsigned int chip_number = -1;
-	unsigned int gpio_number = -1;
-	unsigned int read_val = -1;
-
-	get_chip_and_gpio_number(&chip_number, &gpio_number);
-	printf("INFO : reading gpio %u from chip %u\n", gpio_number, chip_number);
 
 	fd = open(port_paths[chip_number], O_RDWR);
 	if(fd == -1) {
 		printf("ERROR : opening port %s, errno:%d\n",port_paths[chip_number],
 						errno);
-		return;
+		return fd;
 	}
 
 	req.lineoffsets[0] = gpio_number;
-	req.default_values[0] = 0;
+	//req.default_values[0] = 0;
 
 	req.lines = 1;
 	req.flags = GPIOHANDLE_REQUEST_INPUT;
@@ -327,48 +368,56 @@ void read_gpio_port() {
 	rv = ioctl(fd, GPIO_GET_LINEHANDLE_IOCTL, &req);
 	if(rv == -1) {
 		printf("ERROR : ioctl GPIO_GET_LINEHANDLE_IOCTL failed errno:%d\n",errno);
-		return;
+		return rv;
 	}
 
 	rv = ioctl(req.fd, GPIOHANDLE_GET_LINE_VALUES_IOCTL, &data);
 	if(rv == -1) {
 		printf("ERROR : ioctl GPIOHANDLE_GET_LINE_VALUES_IOCTL failed errno:%d\n",errno);
+		return rv;
+	}
+
+	close(req.fd);
+	close(fd);
+
+	return (data.values[0]);
+}
+
+void read_gpio_port() {
+
+	unsigned int chip_number = -1;
+	unsigned int gpio_number = -1;
+	int read_val = -1;
+
+	get_chip_and_gpio_number(&chip_number, &gpio_number);
+	printf("INFO : reading gpio %u from chip %u\n", gpio_number, chip_number);
+
+	read_val = __read_gpio_port(chip_number, gpio_number);
+	if(read_val == -1) {
+		printf("ERROR: reading value\n");
 		return;
 	}
 
-	printf("INFO : value is %u\n",data.values[0]);
-	close(req.fd);
-	close(fd);
+	printf("INFO : value is %u\n",read_val);
+
 }
 
-void write_gpio_port() {
+int __write_gpio_port(unsigned int chip_number, unsigned int gpio_number,
+						unsigned int val) {
 
 	struct gpiohandle_request req;
 	struct gpiohandle_data data;
 	int fd, rv;
-	unsigned int chip_number = -1;
-	unsigned int gpio_number = -1;
-	unsigned int val;
-
-	get_chip_and_gpio_number(&chip_number, &gpio_number);
-	printf("Enter the value to write, valid values 0 or 1\n");
-	if(scanf("%u",&val) == 1) {
-		printf("INFO : writing %u to gpio %u from chip %u\n", val, gpio_number,
-						chip_number);
-	} else {
-		printf("ERROR : invalid value try again!!!\n");
-		return;
-	}
 
 	fd = open(port_paths[chip_number], O_RDWR);
 	if(fd == -1) {
 		printf("ERROR : opening port %s, errno:%d\n",port_paths[chip_number],
 						errno);
-		return;
+		return fd;
 	}
 
 	req.lineoffsets[0] = gpio_number;
-	req.default_values[0] = 0;
+	//req.default_values[0] = 0;
 
 	req.lines = 1;
 	req.flags = GPIOHANDLE_REQUEST_OUTPUT;
@@ -377,30 +426,79 @@ void write_gpio_port() {
 	rv = ioctl(fd, GPIO_GET_LINEHANDLE_IOCTL, &req);
 	if(rv == -1) {
 		printf("ERROR : ioctl GPIO_GET_LINEHANDLE_IOCTL failed errno:%d\n",errno);
-		return;
+		return rv;
 	}
 
 	data.values[0] = val;
 	rv = ioctl(req.fd, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data);
 	if(rv == -1) {
 		printf("ERROR : ioctl GPIOHANDLE_GET_LINE_VALUES_IOCTL failed errno:%d\n",errno);
+		return rv;
+	}
+
+	close(req.fd);
+	close(fd);
+
+	return 0;
+
+}
+
+void write_gpio_port() {
+
+	unsigned int chip_number = -1;
+	unsigned int gpio_number = -1;
+	unsigned int val;
+	int rc = -1;
+	get_chip_and_gpio_number(&chip_number, &gpio_number);
+	printf("Enter the value to write, valid values 0 or 1\n");
+	if(scanf("%u",&val) != 1) {
+		printf("ERROR : invalid value try again!!!\n");
+		return;
+	}
+	printf("INFO : writing %u to gpio %u from chip %u\n", val, gpio_number,
+						chip_number);
+
+	rc = __write_gpio_port(chip_number, gpio_number, val);
+	if(rc == -1) {
+		printf("ERROR :  writing to gpio\n");
 		return;
 	}
 
 	printf("SUCCESS : set %u to gpio %u\n", val, gpio_number);
 
-	close(req.fd);
-	close(fd);
 }
 
+/*
+** PAD register starts at 0x719000
+** PORT A pad registers are 0x719000 and 0x719004
+** PORT B pad registers are 0x719008 and 0x71900c
+** PORT C pad registers are 0x719010 and 0x719014
+** PORT D pad registers are 0x719018 and 0x71901c
+*/
 void pull_up_gpio_port () {
 
 	unsigned int chip_number = -1;
 	unsigned int gpio_number = -1;
+	int ret = 0;
+	char cmd[100];
 
 	get_chip_and_gpio_number(&chip_number, &gpio_number);
-	printf("INFO : Pulling up port %u from chip %u\n", gpio_number, chip_number);
+	printf("INFO : Pulling up gpio %u from chip %u\n", gpio_number, chip_number);
 
+	ret = sprintf(cmd, DEVMEM_STR,
+			GPIO_PAD_REGISTER + (chip_number*MAX_GPIOS_PER_PORT) +
+			((gpio_number/GPIOS_PER_PAD_REGISTER)*GPIOS_PER_PAD_REGISTER), 'w',
+			(port_pull_up_regs_bit_mask[gpio_number%GPIOS_PER_PAD_REGISTER] |
+					DEFAULT_PAD_REGISTER_VALUE));
+	if(ret <= 0) {
+		printf("ERROR : command is not valid\n");
+		return;
+	}
+
+	printf("INFO : command = %s\n", cmd);
+
+	ret = system(cmd);
+	printf("INFO : ret %d\n",ret);
 
 }
 
@@ -408,30 +506,197 @@ void pull_down_gpio_port () {
 
 	unsigned int chip_number = -1;
 	unsigned int gpio_number = -1;
+	int ret = 0;
+	char cmd[100];
 
 	get_chip_and_gpio_number(&chip_number, &gpio_number);
-	printf("INFO : Pulling Down port %u from chip %u\n", gpio_number, chip_number);
+	printf("INFO : Pulling down gpio %u from chip %u\n", gpio_number, chip_number);
 
+	ret = sprintf(cmd, DEVMEM_STR,
+			GPIO_PAD_REGISTER + (chip_number*MAX_GPIOS_PER_PORT) +
+			((gpio_number/GPIOS_PER_PAD_REGISTER)*GPIOS_PER_PAD_REGISTER), 'w',
+			(port_pull_down_regs_bit_mask[gpio_number%GPIOS_PER_PAD_REGISTER] |
+					DEFAULT_PAD_REGISTER_VALUE));
+	if(ret <= 0) {
+		printf("ERROR : command is not valid\n");
+		return;
+	}
+
+	printf("INFO : command = %s\n", cmd);
+
+	ret = system(cmd);
+	printf("INFO : ret %d\n",ret);
 }
+
+void __loopback_test(unsigned int source_chip_number,
+						unsigned int source_gpio_number,
+						unsigned int sink_chip_number,
+						unsigned int sink_gpio_number) {
+
+	int write_val = 0;;
+	int read_val = -1;
+
+	printf("===== %d,%d <-------> %u,%u =====\n",
+									source_chip_number, source_gpio_number,
+									sink_chip_number, sink_gpio_number);
+	printf("INFO : Writing %u to source loopback\n", write_val);
+	__write_gpio_port(source_chip_number, source_gpio_number, write_val);
+	read_val = __read_gpio_port(sink_chip_number, sink_gpio_number);
+	if(read_val != write_val) {
+		printf("ERROR: XXXXXXXXXXXXXXXXXXX FAIL XXXXXXXXXXXXXXXXXXXXX\n");
+		printf("written val is %u, read val is %u\n", write_val, read_val);
+		exit(0);
+	}
+
+	printf("INFO : Writing %u to sink loopback\n", write_val);
+	__write_gpio_port(sink_chip_number, sink_gpio_number, write_val);
+	read_val = __read_gpio_port(source_chip_number, source_gpio_number);
+	if(read_val != write_val) {
+		printf("ERROR : XXXXXXXXXXXXXXXXXXX FAIL XXXXXXXXXXXXXXXXXXXXX\n");
+		printf("written val is %u, read val is %u\n", write_val, read_val);
+		exit(0);
+	}
+
+	write_val = write_val ^ 0x1;
+	printf("INFO : Writing %u to source loopback\n", write_val);
+	__write_gpio_port(source_chip_number, source_gpio_number, write_val);
+	read_val = __read_gpio_port(sink_chip_number, sink_gpio_number);
+	if(read_val != write_val) {
+		printf("ERROR: XXXXXXXXXXXXXXXXXXX FAIL XXXXXXXXXXXXXXXXXXXXX\n");
+		printf("written val is %u, read val is %u\n", write_val, read_val);
+		exit(0);
+	}
+
+	printf("INFO : Writing %u to sink loopback\n", write_val);
+	__write_gpio_port(sink_chip_number, sink_gpio_number, write_val);
+	read_val = __read_gpio_port(source_chip_number, source_gpio_number);
+	if(read_val != write_val) {
+		printf("ERROR : XXXXXXXXXXXXXXXXXXX FAIL XXXXXXXXXXXXXXXXXXXXX\n");
+		printf("written val is %u, read val is %u\n", write_val, read_val);
+		exit(0);
+	}
+}
+
+void loopback_test() {
+
+	unsigned int source_chip_number;
+	unsigned int source_gpio_number;
+	unsigned int sink_chip_number;
+	unsigned int sink_gpio_number;
+
+	printf("INFO : Enter LOOPBACK source details\n");
+	get_chip_and_gpio_number(&source_chip_number, &source_gpio_number);
+
+	printf("INFO : Enter LOOPBACK sink details\n");
+	get_chip_and_gpio_number(&sink_chip_number, &sink_gpio_number);
+
+	__loopback_test(source_chip_number, source_gpio_number, sink_chip_number,
+						sink_gpio_number);
+}
+
+/*
+** Skipping gpio 17 and 18 because of the hw fault, and because of how the test
+** is laid out skipping gpio 0  and 1
+*/
+void loopback_long_run_test() {
+
+	unsigned int source = 2;
+	unsigned int sink = (MAX_GPIOS/2) + 2;
+
+	while(1) {
+		if(sink == MAX_GPIOS) {
+			source = 2;
+			sink = (MAX_GPIOS/2) + 2;
+		}
+
+		__loopback_test((source/8), (source%8), (sink/8), (sink%8));
+		source++;
+		sink++;
+	}
+}
+
+#if 0
+void *event_thread(void *arg) {
+
+	struct gpioevent_request *event_req = (struct gpioevent_request *)arg;
+	char *ret;
+	struct gpioevent_data  event;
+
+	while(1) {
+		printf("INFO : waiting for event\n");
+		int rc = read(event_req->fd, &event, sizeof(event));
+
+		printf("GPIO_EVENT : timestamp %llu\n", event.timestamp);
+	}
+	close(event_req->fd);
+
+#if 0
+		if ((ret = (char*) malloc(20)) == NULL) {
+			perror("malloc() error");
+			exit(2);
+		}
+		strcpy(ret, "This is a test");
+#endif
+	pthread_exit(ret);
+}
+
+
+void interrupt_test() {
+
+	pthread_t tid;
+	struct gpioevent_request event_req;
+	struct gpiohandle_data data;
+	int fd, rv;
+  	void *ret;
+
+	fd = open(port_paths[0], O_RDWR);
+	if(fd == -1) {
+		printf("ERROR : opening port %s, errno:%d\n",port_paths[0],
+						errno);
+		return;
+	}
+
+	event_req.lineoffset = 3;
+	event_req.handleflags = GPIOHANDLE_REQUEST_INPUT;
+	event_req.eventflags = GPIOEVENT_REQUEST_RISING_EDGE;
+	strncpy(event_req.consumer_label,"GPIO_INTERRUPT",13);
+
+	rv = ioctl(fd, GPIO_GET_LINEEVENT_IOCTL, &event_req);
+	if(rv == -1) {
+		printf("ERROR : ioctl GPIO_GET_LINEEVENT_IOCTL failed errno:%d\n",errno);
+		return;
+	}
+
+	if (pthread_create(&tid, NULL, event_thread, &event_req) != 0) {
+		printf("ERROR : pthread_create() failed");
+		exit(1);
+	}
+
+	//close(fd);
+}
+#endif
 
 void print_menu() {
 
-	printf("\t ===== select one of the below option =====\n");
+	printf("==============================================================\n");
+	printf("=============== select one of the below option ===============\n");
+	printf("==============================================================\n");
 	printf("\t 1. Print port info \n");
 	printf("\t 2. Toggle all leds \n");
 	printf("\t 3. Print Binary on leds\n");
-	printf("\t 4. Overnight Test \n");
-	printf("\t 5. Read from GPIO PORT\n");
-	printf("\t 6. Write to GPIO PORT\n");
-	printf("\t 7. Pull up GPIO PORT\n");
-	printf("\t 8. Pull down GPIO PORT\n");
-	printf("\t 9. Toggle all GPIOs\n");
+	printf("\t 4. Loopback Test \n");
+	printf("\t 5. Loopback long run Test \n");
+	printf("\t 6. Read from GPIO PORT\n");
+	printf("\t 7. Write to GPIO PORT\n");
+	printf("\t 8. Pull up GPIO PORT\n");
+	printf("\t 9. Pull down GPIO PORT\n");
+	printf("\t 10. Toggle all GPIOs\n");
+	//printf("\t 11. Interrupt Test\n");
 	printf("\t 0. Quit\n");
 }
 
 int main() {
 
-	printf("\t========== Hello GPIO world ==========\n");
 	unsigned int led_arr[] = {0, 4, 5};
 	unsigned int quit = 0;
 	int option = 0;
@@ -466,24 +731,33 @@ int main() {
 								sizeof(led_arr)/sizeof(led_arr[0]), (1 << 3));
 						break;
 					case 4:
-						overnight_test();
+						loopback_test();
 						break;
 					case 5:
-						read_gpio_port();
+						loopback_long_run_test();
 						break;
 					case 6:
-						write_gpio_port();
+						read_gpio_port();
 						break;
 					case 7:
-						pull_up_gpio_port();
+						write_gpio_port();
 						break;
 					case 8:
-						pull_down_gpio_port();
+						pull_up_gpio_port();
 						break;
 					case 9:
+						pull_down_gpio_port();
+						break;
+					case 10:
 						printf("Toggling all GPIOs\n");
 						toggle_all_gpios(10);
 						break;
+#if 0
+					case 11:
+						printf("Interrupt Test\n");
+						interrupt_test();
+						break;
+#endif
 					case 0:
 						printf("Good bye\n");
 						quit = 1;
