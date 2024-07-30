@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -15,6 +16,9 @@
 #include <pthread.h>
 #include <libgen.h>
 #include <simaai/simaai_memory.h>
+
+unsigned long int modify_byte(unsigned long int value, int index, unsigned char new_byte);
+bool check_adjacent_bytes(unsigned long int value, unsigned long int modified, int index);
 
 typedef enum {
 	PATTERN_55,
@@ -26,6 +30,9 @@ typedef enum {
 	PATTERN_RANDOM,
 	PATTERN_ADDRESS,
 	PATTERN_USER,
+	PATTERN_WALKING_1,
+	PATTERN_WALKING_0,
+	PATTERN_CHECK_ADJACENT,
 	PATTERN_NUM,
 } pattern_type;
 
@@ -38,6 +45,7 @@ typedef struct {
 	unsigned int threads;
 	int random;
 	int readback;
+	int performance;
 } args;
 
 typedef struct {
@@ -49,6 +57,8 @@ typedef struct {
 	unsigned long int size;
 	int random;
 	int readback;
+	int performance;
+	unsigned int sleep_time;
 } load_task;
 
 static int targets[] = {
@@ -56,6 +66,7 @@ static int targets[] = {
 		SIMAAI_MEM_TARGET_DMS1,
 		SIMAAI_MEM_TARGET_DMS2,
 		SIMAAI_MEM_TARGET_DMS3,
+		SIMAAI_MEM_TARGET_OCM,
 };
 
 static int parse_args(const int argc, char *const argv[], args *args)
@@ -71,6 +82,7 @@ static int parse_args(const int argc, char *const argv[], args *args)
 		{ "size",     required_argument, NULL, 's' },
 		{ "threads",  required_argument, NULL, 't' },
 		{ "random",   no_argument,       NULL, 'r' },
+		{ "performance", no_argument,    NULL, 'f' },
 		{ 0,        0,                 0,     0  }
 	};
 	const char usage[] =
@@ -80,7 +92,7 @@ static int parse_args(const int argc, char *const argv[], args *args)
 		"  -h, --help            Display this help and exit\n"
 		"  -d, --ddrcmask=MASK   Hex mask of controllers to be tested, default: 0xf (all)\n"
 		"  -b, --readback        Read test after populating buffer, default: no\n"
-		"  -p, --pattern=[0..8]  Pattern to use for testing, default: random\n"
+		"  -p, --pattern=[0..11]  Pattern to use for testing, default: random\n"
 		"                        Possible options:\n"
 		"                            0 - 0x55\n"
 		"                            1 - 0xAA\n"
@@ -91,17 +103,21 @@ static int parse_args(const int argc, char *const argv[], args *args)
 		"                            6 - random\n"
 		"                            7 - 8-byte address\n"
 		"                            8 - 8-byte user defined\n"
+		"                            9 - Walking 1's - 0x8040201008040201\n"
+		"                            10 - Walking 0's - 0x7FBFDFEFF7FBFDFE\n"
+		"                            11 - Checking adjacent bits upon modifying 2 bits in between\n"
 		"  -v, --value=VALUE     Hex value of 8-byte pattern to use for testing in case if user defined pattern, default: 0xA55AAA555AA555AA\n"
 		"  -t, --time=TIME       Time to run test, if 0 - run forever, default: run forever\n"
-		"  -s, --size=SIZE       Size of the buffer to use for test, default: 1048510\n"
+		"  -s, --size=SIZE       Size of the buffer to use for test, default: 0x100000\n"
 		"  -w, --workers=THREADS Number of worker threads per DDRC, default: 1\n"
-		"  -r, --random          Access to buffer not in sequential, but random order, default: no\n";
+		"  -r, --random          Access to buffer not in sequential, but random order, default: no\n"
+		"  -f, --performance     prints bandwidth number of bytes per second default:no\n";
 	int option_index;
 	int c;
 
 	while (1) {
 		option_index = 0;
-		c = getopt_long(argc, argv, "hd:p:v:t:s:w:rb", long_options, &option_index);
+		c = getopt_long(argc, argv, "hd:p:v:t:s:w:rbf", long_options, &option_index);
 
 		if (c == -1)
 			break;
@@ -116,7 +132,7 @@ static int parse_args(const int argc, char *const argv[], args *args)
 			break;
 		case 'd':
 			args->ddrc_mask = strtol(optarg, NULL, 16);
-			if (args->ddrc_mask > 0xf) {
+			if (args->ddrc_mask > 0x1f) {
 				fprintf(stderr, "Invalid DDRC mask\n");
 				return -1;
 			}
@@ -135,7 +151,7 @@ static int parse_args(const int argc, char *const argv[], args *args)
 			args->sleep_time = strtoul(optarg, NULL, 10);
 			break;
 		case 's':
-			args->size = strtoul(optarg, NULL, 10);
+			args->size = strtoul(optarg, NULL, 16);
 			break;
 		case 'w':
 			args->threads = strtoul(optarg, NULL, 10);
@@ -146,6 +162,9 @@ static int parse_args(const int argc, char *const argv[], args *args)
 		case 'b':
 			args->readback = 1;
 			break;
+		case 'f':
+			args->performance = 1;
+			break;
 		default:
 			fprintf(stderr, usage, basename(filename));
 			return -1;
@@ -155,17 +174,41 @@ static int parse_args(const int argc, char *const argv[], args *args)
 
 	return 0;
 }
+unsigned long int modify_byte(unsigned long int value, int index, unsigned char new_byte) {
+	unsigned long int mask = 0xFFUL << (index * 8);
+	value&=~mask;
+	value|=((unsigned long int)new_byte << (index * 8));
+	return value;
+}
+bool check_adjacent_bytes(unsigned long int value, unsigned long int modified, int index) {
+	unsigned long int mask_left = 0xFFUL << ((index+1) * 8);
+	unsigned long int mask_right = 0xFFUL >> ((7-index) * 8);
 
+	if(((value&mask_left)!=(modified&mask_left))&&((value&mask_right)!=(modified&mask_right)))
+		return false;
+	else
+		return true;
+}
 static void* loader_task(void *arg)
 {
 	volatile load_task *task = (volatile load_task *)arg;
-	unsigned long int value, i, offset, dummy = 0;
+	unsigned long int value, i, offset, dummy = 0, err_count = 0;
 	unsigned long int *addr;
+	unsigned long int bytes_count = 0;
+	struct timespec start, current;
+	double elapsed_time;
 
 	if(!task)
 		return NULL;
 
 	addr = (unsigned long int *)simaai_memory_map(task->buffer);
+	if (addr == NULL) {
+		fprintf(stderr, "Memory mapping failed\n");
+		return NULL;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
 	switch(task->type) {
 	case PATTERN_55:
 		value = 0x5555555555555555;
@@ -185,6 +228,31 @@ static void* loader_task(void *arg)
 	case PATTERN_AA55:
 		value = 0xAA55AA55AA55AA55;
 		break;
+	case PATTERN_WALKING_1:
+		for (i = 0; i < (task->size); i++){
+			for (int bit = 0; bit < 8; bit++) {
+				unsigned char val = (1 << (7-bit));
+				((volatile char *)addr)[i] = val;
+				unsigned char read = ((volatile char *)addr)[i];
+				if(read != val){
+					fprintf(stderr, "Data mismatch in Walking 1\n");
+				}
+			}
+		}
+		break;
+	case PATTERN_WALKING_0:
+		for (i = 0; i < (task->size); i++){
+			for (int bit = 0; bit < 8; bit++) {
+				unsigned char val = ~(1 << (7-bit));
+				((volatile char *)addr)[i] = val;
+				unsigned char read = ((volatile char *)addr)[i];
+				if(read != val){
+					fprintf(stderr, "Data mismatch in Walking 0\n");
+				}
+			}
+		}
+		break;
+	case PATTERN_CHECK_ADJACENT:
 	case PATTERN_USER:
 	default:
 		value = task->value;
@@ -201,12 +269,36 @@ static void* loader_task(void *arg)
 				value = random();
 			else if(task->type == PATTERN_ADDRESS)
 				value = (long unsigned int)&(addr[offset]);
-			addr[offset] = value;
+			if(task->type == PATTERN_CHECK_ADJACENT){
+				int index = 3;
+				unsigned char new_byte = 0x55;
+				unsigned long int modified = modify_byte(value, index, new_byte); 
+				if (!check_adjacent_bytes(value, modified, index)) 
+					err_count++;
+					break;
+			}
+			if (task->performance) {
+				clock_gettime(CLOCK_MONOTONIC, &current);
+				elapsed_time = (current.tv_sec - start.tv_sec) + (current.tv_nsec - start.tv_nsec) / 1e9;
+				if(elapsed_time >= task->sleep_time) {
+					task->active=0;
+					break;
+				}
+				value = random();
+				addr[offset] = value;
+				bytes_count += sizeof(value);
+			} 
+			else 
+				addr[offset] = value;
 		}
 		simaai_memory_flush_cache(task->buffer);
 		if(task->readback)
 			break;
 	}
+	if (err_count > 0)
+		fprintf(stderr, "ERROR: Adjacent bits disturbed %lu\n", err_count);
+	if (task->performance)
+		fprintf(stderr, "Total bytes: %lu\n", bytes_count);
 
 	if(task->readback) {
 		while(task->active) {
@@ -216,7 +308,6 @@ static void* loader_task(void *arg)
 			}
 		}
 	}
-
 	simaai_memory_unmap(task->buffer);
 
 	return NULL;
@@ -233,6 +324,7 @@ int main(int argc, char *argv[])
 			.random = 0,
 			.value = 0xA55AAA555AA555AA,
 			.readback = 0,
+			.performance  = 0,
 	};
 	int i, j, k = 0, res, threads = 0;
 	load_task *tasks;
@@ -242,7 +334,7 @@ int main(int argc, char *argv[])
 	}
 
 	//Calculate amount of thread
-	for(i = 0; i < 4; i++)
+	for(i = 0; i < 5; i++)
 		if((args.ddrc_mask >> i) & 1)
 			threads += args.threads;
 
@@ -253,11 +345,16 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	for(i = 0; i < 4; i++) {
+	for(i = 0; i < 5; i++) {
 		if((args.ddrc_mask >> i) & 1)
 			for(j = 0; j < args.threads; j++) {
 				//Allocate CMA buffer size per worker
-				tasks[k].buffer = simaai_memory_alloc_flags(args.size, targets[i], SIMAAI_MEM_FLAG_CACHED);
+				if(args.type > 8 || args.readback){
+					tasks[k].buffer = simaai_memory_alloc_flags(args.size, targets[i],SIMAAI_MEM_FLAG_DEFAULT);
+				}
+				else
+					tasks[k].buffer = simaai_memory_alloc_flags(args.size, targets[i], SIMAAI_MEM_FLAG_CACHED);
+				
 				if(tasks[k].buffer == NULL)
 					goto error;
 				//Fill task structure
@@ -267,6 +364,8 @@ int main(int argc, char *argv[])
 				tasks[k].size = args.size;
 				tasks[k].random = args.random;
 				tasks[k].readback = args.readback;
+				tasks[k].performance = args.performance;
+				tasks[k].sleep_time = args.sleep_time;
 				//start thread
 				res = pthread_create(&(tasks[k].thread), NULL, &loader_task, &(tasks[k]));
 				if(res != 0)

@@ -70,6 +70,9 @@ main:
         cmp         w29, #8
         blt         1f
         bl          fork /* have at least 8 cores */
+        cmp         w29, #16
+        blt         1f
+        bl          fork /* have at least 16 cores */
 1:
 #endif
         /* use 128b NEON registers v0-v31 */
