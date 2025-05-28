@@ -200,14 +200,11 @@ static void* loader_task(void *arg)
 
 	if(!task)
 		return NULL;
-
 	addr = (unsigned long int *)simaai_memory_map(task->buffer);
 	if (addr == NULL) {
 		fprintf(stderr, "Memory mapping failed\n");
 		return NULL;
 	}
-
-	clock_gettime(CLOCK_MONOTONIC, &start);
 
 	switch(task->type) {
 	case PATTERN_55:
@@ -259,56 +256,90 @@ static void* loader_task(void *arg)
 		break;
 	}
 
+	static int target = SIMAAI_MEM_TARGET_DMS0;
+
+	simaai_memory_t *input_buffer = simaai_memory_alloc_flags(task->size, target, SIMAAI_MEM_FLAG_CACHED);
+    if (!input_buffer) {
+        perror("Input buffer allocation failed");
+    }
+    void *input_addr = simaai_memory_map(input_buffer);
+    if (!input_addr) {
+        perror("Input buffer mapping failed");
+        simaai_memory_free(input_buffer);
+    }
+
+	memset(input_addr, 0xAA, task->size);
+
+	double time_diff(struct timespec *start, struct timespec *end) {
+    	return (end->tv_sec - start->tv_sec) + (end->tv_nsec - start->tv_nsec) / 1e9;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
 	while(task->active) {
-		for(i = 0; i < (task->size >> 8); i++) {
-			if(task->random)
-				offset = random() % (task->size >> 8);
-			else
-				offset = i;
-			if(task->type == PATTERN_RANDOM)
-				value = random();
-			else if(task->type == PATTERN_ADDRESS)
-				value = (long unsigned int)&(addr[offset]);
-			if(task->type == PATTERN_CHECK_ADJACENT){
-				int index = 3;
-				unsigned char new_byte = 0x55;
-				unsigned long int modified = modify_byte(value, index, new_byte); 
-				if (!check_adjacent_bytes(value, modified, index)) 
-					err_count++;
-					break;
+		if (task->performance){
+			memcpy(addr, input_addr, task->size);
+			clock_gettime(CLOCK_MONOTONIC, &current);
+			elapsed_time = time_diff(&start, &current);			
+			if(elapsed_time >= (double)(task->sleep_time)) {
+				task->active=0;
+				break;
+			} else {
+				bytes_count += (task->size / (1024*1024));
 			}
-			if (task->performance) {
-				clock_gettime(CLOCK_MONOTONIC, &current);
-				elapsed_time = (current.tv_sec - start.tv_sec) + (current.tv_nsec - start.tv_nsec) / 1e9;
-				if(elapsed_time >= task->sleep_time) {
-					task->active=0;
-					break;
+		} 
+		else {
+			for(i = 0; (i < (task->size >> 8)); i++) {
+				if(task->random)
+					offset = random() % (task->size >> 8);
+				else
+					offset = i;
+
+				if(task->type == PATTERN_RANDOM)
+					value = random();
+				else if(task->type == PATTERN_ADDRESS)
+					value = (long unsigned int)&(addr[offset]);
+				else if(task->type == PATTERN_CHECK_ADJACENT){
+					int index = 3;
+					unsigned char new_byte = 0x55;
+					unsigned long int modified = modify_byte(value, index, new_byte); 
+					if (!check_adjacent_bytes(value, modified, index)) {
+						err_count++;
+						break;
+					}
 				}
-				value = random();
-				addr[offset] = value;
-				bytes_count += sizeof(value);
-			} 
-			else 
-				addr[offset] = value;
+				else 
+					addr[offset] = value;
+			}
+			task->active = 0;
 		}
 		simaai_memory_flush_cache(task->buffer);
 		if(task->readback)
 			break;
 	}
+
+	fprintf(stderr, "Bytes Count (MB): %ld\n", bytes_count);
+	fprintf(stderr, "Elapsed Time: %.2fs\n", elapsed_time);
+	
+	if (task->performance)
+			fprintf(stderr, "Throughput: %.2fGB/s\n", ((double) bytes_count/(1024*elapsed_time)));
+		else
+			fprintf(stderr, "Pattern Loaded\n");
+
 	if (err_count > 0)
 		fprintf(stderr, "ERROR: Adjacent bits disturbed %lu\n", err_count);
-	if (task->performance)
-		fprintf(stderr, "Total bytes: %lu\n", bytes_count);
 
 	if(task->readback) {
+		task->active = 1;
 		while(task->active) {
 			simaai_memory_invalidate_cache(task->buffer);
 			for(i = 0; i < (task->size >> 8); i++) {
 				dummy += addr[offset];
 			}
+			task->active = 0;
 		}
 	}
 	simaai_memory_unmap(task->buffer);
+	exit(EXIT_SUCCESS);
 
 	return NULL;
 }
@@ -319,7 +350,7 @@ int main(int argc, char *argv[])
 			.type = PATTERN_RANDOM,
 			.size = 0x100000,
 			.sleep_time = 0,
-			.ddrc_mask = 0xf,
+			.ddrc_mask = 0x1,
 			.threads = 1,
 			.random = 0,
 			.value = 0xA55AAA555AA555AA,
@@ -355,8 +386,10 @@ int main(int argc, char *argv[])
 				else
 					tasks[k].buffer = simaai_memory_alloc_flags(args.size, targets[i], SIMAAI_MEM_FLAG_CACHED);
 				
-				if(tasks[k].buffer == NULL)
+				if(tasks[k].buffer == NULL){
+					fprintf(stderr, "ERROR: Buffer is NULL\n");
 					goto error;
+				}
 				//Fill task structure
 				tasks[k].active = 1;
 				tasks[k].type = args.type;
