@@ -1,38 +1,58 @@
 port=1
 loopback=0
-while getopts p:l:h flag
+machine="davinci";
+while getopts p:l:m:h flag
 do
     case "${flag}" in
         p) port=${OPTARG};;
         l) loopback=${OPTARG};;
+        m) machine=${OPTARG};;
         h) echo "Usage: set_sgmii_rxtx_loopback.sh [Options]
         Options:
                 -p <PORT>: PHY port number, [0 .. 3], default: 1
                 -l <VAL> : 1 to enable loopback mode, 0 to disable loopback mode, default: 0
+                -m <MACHINE> : davinci or michelangelo
                 -h : Print this information, default: false";;
     esac
 done
-if ((port < 0)); then
+if [ "$port" -lt 0 ]; then
     port=0
 fi
-if ((port > 3)); then
+if [ "$port" -gt 3 ]; then
     port=3
 fi
-if ((loopback < 0)); then
+if [ "$loopback" -lt 0 ]; then
     loopback=0
 fi
-if ((loopback > 1)); then
+if [ "$loopback" -gt 1 ]; then
     loopback=1
 fi
 echo "port: $port"
 echo "loopback: $loopback"
-regxaddr=$((0x11e0240 + port*0x0200000))
-regaddr=$((0x1000 + port*0x100))
-regval=$((0x5100 + loopback*0x10))
-devmem2 $regxaddr w $regval > /dev/null
+echo "machine: $machine"
+
+case $machine in
+	davinci)
+		off_regxaddr=0x11e0240
+		off_regval=0x5100
+		;;
+	michelangelo)
+		off_regxaddr=0xa060240
+		off_regval=0x4000
+		;;
+    *)
+        echo "Error: Invalid machine type '$machine'. Please use 'davinci' or 'michelangelo'."
+        exit 1
+esac
+
+mask=$((0xFFFFFF00))
+regxaddr=$((off_regxaddr + port * 0x0200000))
+regaddr=$((0x1000 + port * 0x100))
+regval=$((off_regval + loopback * 0x10))
+devmem2 "$regxaddr" w "$regval" > /dev/null
 sleep 0.1
-regval=$((loopback*0x6))
-devmem2 0x11e0284 w $regaddr > /dev/null
-devmem2 0x11e0288 w $regval > /dev/null
-devmem2 0x11e0280 w 3 > /dev/null
+regval=$((loopback * 0x6))
+devmem2 $(((off_regxaddr & mask) | 0x84)) w "$regaddr" > /dev/null
+devmem2 $(((off_regxaddr & mask) | 0x88)) w "$regval" > /dev/null
+devmem2 $(((off_regxaddr & mask) | 0x80)) w 3 > /dev/null
 echo "Set SGMII RX to TX loopback!"

@@ -1,0 +1,8 @@
+[Unit]
+Description=SiMa.ai service for platform test for (eMMC, SDIO, SDMA, OCM and DDR)
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/bin/simaai_pt/platform-tests.py
+
+[Install]
+WantedBy=multi-user.target
